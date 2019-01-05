@@ -2,14 +2,17 @@ package mapreduce
 
 import (
 	"fmt"
-	"sync"
 )
 
-func handleTask(worker string, args DoTaskArgs, finishChan chan string, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	call(worker, "Worker.DoTask", &args, nil)
-	finishChan <- worker
+func handleTask(worker string, args DoTaskArgs, successWorkerChan chan string, failWorkerChan chan string, taskChan chan DoTaskArgs) {
+	success := call(worker, "Worker.DoTask", &args, nil)
+	if success {
+		successWorkerChan <- worker
+	} else {
+		fmt.Println(worker, "executing task", args.TaskNumber, "has failed")
+		taskChan <- args
+		failWorkerChan <- worker
+	}
 }
 
 //
@@ -44,31 +47,65 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	//        add worker to workers list
 	//        assign work to worker
 	//    workerChannels (each worker):
-	finishChan := make(chan string, 10)
-	var wg sync.WaitGroup
-	for i := 0; i < ntasks; i++ {
-		var args DoTaskArgs
-		args.JobName = jobName
-		if phase == mapPhase {
-			args.File = mapFiles[i]
-		}
-		args.Phase = phase
-		args.TaskNumber = i
-		args.NumOtherPhase = n_other
 
+	taskChan := make(chan DoTaskArgs, ntasks)
+	go func() {
+		for i := 0; i < ntasks; i++ {
+			var args DoTaskArgs
+			args.JobName = jobName
+			if phase == mapPhase {
+				args.File = mapFiles[i]
+			}
+			args.Phase = phase
+			args.TaskNumber = i
+			args.NumOtherPhase = n_other
+			taskChan <- args
+		}
+	}()
+
+	successWorkerChan := make(chan string, 11)
+	failWorkerChan := make(chan string, 10)
+	tasksRemaining := ntasks
+	tasksOutstanding := 0
+	workerFree := make(map[string]bool)
+	// assumption: once a worker dies, don't want to assign any more work to that worker
+	for tasksRemaining > 0 {
+		// fmt.Println(tasksRemaining, "tasks remaining")
 		select {
 		case newWorker := <-registerChan:
-			wg.Add(1)
-			// fmt.Println("found new worker", newWorker)
-			go handleTask(newWorker, args, finishChan, &wg)
-		case nextWorker := <-finishChan:
-			wg.Add(1)
-			// fmt.Println(nextWorker, "reported done")
-			go handleTask(nextWorker, args, finishChan, &wg)
+			workerFree[newWorker] = true
+			if tasksRemaining-tasksOutstanding > 0 {
+				nextTask := <-taskChan
+				tasksOutstanding = tasksOutstanding + 1
+				workerFree[newWorker] = false
+				go handleTask(newWorker, nextTask, successWorkerChan, failWorkerChan, taskChan)
+			}
+		case nextWorker := <-successWorkerChan:
+			tasksOutstanding = tasksOutstanding - 1
+			tasksRemaining = tasksRemaining - 1
+			// even if there are tasks remaining, they may have already been scheduled
+			if tasksRemaining-tasksOutstanding > 0 {
+				nextTask := <-taskChan
+				tasksOutstanding = tasksOutstanding + 1
+				go handleTask(nextWorker, nextTask, successWorkerChan, failWorkerChan, taskChan)
+			} else {
+				workerFree[nextWorker] = true
+			}
+		case failedWorker := <-failWorkerChan:
+			delete(workerFree, failedWorker)
+			tasksOutstanding = tasksOutstanding - 1
+			// if no outstanding tasks, then need to assign to worker; if no outstanding workers, wait for success from existing worker or for new worker
+			for worker, isFree := range workerFree {
+				if isFree {
+					workerFree[worker] = false
+					nextTask := <-taskChan
+					tasksOutstanding = tasksOutstanding + 1
+					go handleTask(worker, nextTask, successWorkerChan, failWorkerChan, taskChan)
+					break
+				}
+			}
 		}
 	}
-
-	wg.Wait()
 
 	fmt.Printf("Schedule: %v done\n", phase)
 }

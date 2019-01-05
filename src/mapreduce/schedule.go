@@ -1,6 +1,16 @@
 package mapreduce
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
+
+func handleTask(worker string, args DoTaskArgs, finishChan chan string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	call(worker, "Worker.DoTask", &args, nil)
+	finishChan <- worker
+}
 
 //
 // schedule() starts and waits for all tasks in the given phase (mapPhase
@@ -27,8 +37,38 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 
 	// All ntasks tasks have to be scheduled on workers. Once all tasks
 	// have completed successfully, schedule() should return.
-	//
-	// Your code here (Part III, Part IV).
-	//
+
+	// scheduling policy: every worker's goroutine has a channel; when a worker can be assigned work, a new goroutine is created to schedule the work, wait for a response, and then write to the worker's channel that it is done
+	// select on:
+	//    registerChan (new worker):
+	//        add worker to workers list
+	//        assign work to worker
+	//    workerChannels (each worker):
+	finishChan := make(chan string, 10)
+	var wg sync.WaitGroup
+	for i := 0; i < ntasks; i++ {
+		var args DoTaskArgs
+		args.JobName = jobName
+		if phase == mapPhase {
+			args.File = mapFiles[i]
+		}
+		args.Phase = phase
+		args.TaskNumber = i
+		args.NumOtherPhase = n_other
+
+		select {
+		case newWorker := <-registerChan:
+			wg.Add(1)
+			// fmt.Println("found new worker", newWorker)
+			go handleTask(newWorker, args, finishChan, &wg)
+		case nextWorker := <-finishChan:
+			wg.Add(1)
+			// fmt.Println(nextWorker, "reported done")
+			go handleTask(nextWorker, args, finishChan, &wg)
+		}
+	}
+
+	wg.Wait()
+
 	fmt.Printf("Schedule: %v done\n", phase)
 }

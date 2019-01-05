@@ -2,7 +2,6 @@ package mapreduce
 
 import (
 	"encoding/json"
-	"fmt"
 	"hash/fnv"
 	"io/ioutil"
 	"os"
@@ -80,7 +79,6 @@ func doMap(
 	// write out every buffer to file name $jobName-intermediate-$mapTask-$bufferIndex
 	for i, outputBuffer := range outputBuffers {
 		outputFilename := reduceName(jobName, mapTask, i)
-		fmt.Println("map task", mapTask, ": writing to ", outputFilename)
 		outputFile, _ := os.Create(outputFilename)
 		enc := json.NewEncoder(outputFile)
 		for _, kv := range outputBuffer {

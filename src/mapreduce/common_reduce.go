@@ -1,5 +1,10 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"os"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +49,32 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+
+	// for every map task, read the reduce task's corresponding intermediate file ($jobName-$jobName-intermediate-$i-$reduceTask)
+	// hash join: keep map of key to all values
+	keyValues := make(map[string][]string)
+	for i := 0; i < nMap; i++ {
+		intermFilename := reduceName(jobName, i, reduceTask)
+		intermFile, _ := os.Open(intermFilename)
+		dec := json.NewDecoder(intermFile)
+		for dec.More() {
+			var kv KeyValue
+			dec.Decode(&kv)
+			if _, ok := keyValues[kv.Key]; !ok {
+				keyValues[kv.Key] = make([]string, 0)
+			}
+			keyValues[kv.Key] = append(keyValues[kv.Key], kv.Value)
+		}
+	}
+
+	outputFile, _ := os.Create(outFile)
+	enc := json.NewEncoder(outputFile)
+
+	// for every key and its grouped values, call reduceF(key, values) and output
+	for key, values := range keyValues {
+		enc.Encode(KeyValue{key, reduceF(key, values)})
+	}
+
+	// write output buffer to file
+	outputFile.Close()
 }

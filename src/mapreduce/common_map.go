@@ -1,7 +1,11 @@
 package mapreduce
 
 import (
+	"encoding/json"
+	"fmt"
 	"hash/fnv"
+	"io/ioutil"
+	"os"
 )
 
 func doMap(
@@ -52,7 +56,38 @@ func doMap(
 	// Remember to close the file after you have written all the values!
 	//
 	// Your code here (Part I).
-	//
+
+	// open and read contents of inFile
+	contents, _ := ioutil.ReadFile(inFile)
+
+	// call mapF with the contents and get the resulting list of KeyValue pairs
+	mapTaskOutput := mapF(inFile, string(contents))
+
+	// create nReduce buffers
+	outputBuffers := make([][]KeyValue, nReduce)
+	for i := range outputBuffers {
+		outputBuffers[i] = make([]KeyValue, 0)
+	}
+
+	// for each result key-value pair:
+	//    buffer index = hash(key) % nReduce
+	//    write key-value pair to given buffer
+	for _, keyValue := range mapTaskOutput {
+		outputIndex := ihash(keyValue.Key) % nReduce
+		outputBuffers[outputIndex] = append(outputBuffers[outputIndex], keyValue)
+	}
+
+	// write out every buffer to file name $jobName-intermediate-$mapTask-$bufferIndex
+	for i, outputBuffer := range outputBuffers {
+		outputFilename := reduceName(jobName, mapTask, i)
+		fmt.Println("map task", mapTask, ": writing to ", outputFilename)
+		outputFile, _ := os.Create(outputFilename)
+		enc := json.NewEncoder(outputFile)
+		for _, kv := range outputBuffer {
+			enc.Encode(&kv)
+		}
+		outputFile.Close()
+	}
 }
 
 func ihash(s string) int {

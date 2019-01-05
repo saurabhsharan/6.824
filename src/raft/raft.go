@@ -23,8 +23,6 @@ import "labrpc"
 // import "bytes"
 // import "labgob"
 
-
-
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -42,6 +40,12 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+const (
+	FollowerState  = iota
+	CandidateState = iota
+	LeaderState    = iota
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -51,22 +55,18 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-
+	currentTerm int // Latest term seen
+	votedFor    int // CandidateId that received vote in current term, or null if none
+	commitIndex int // Highest log entry known to be committed
+	lastApplied int // Highest log entry applied to current state machine
+	state       int // Current state: follower, candidate, or leader
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	return rf.currentTerm, rf.state == LeaderState
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -83,7 +83,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -107,15 +106,15 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+	Term         int // candidate's term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // index of candidate's last log entry
+	LastLogTerm  int // term of candidate's last log entry
 }
 
 //
@@ -123,14 +122,45 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	// Your data here (2A).
+	Term        int  // currentTerm, for candidate to update itself
+	VoteGranted bool // true iff candidate received vote
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	// Reject requests from earlier epoch
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	// Save current term, which is compared to args.LastLogTerm (since we don't store that in rf state)
+	ourLastLogTerm := rf.currentTerm
+
+	// If from later epoch, update our epoch and move to follower state
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.state = FollowerState
+	}
+
+	grantVote := false
+	// Check if we haven't voted for anyone or already for this candidate
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		// Check that candidate's log is at least as up-to-date as receiver's log, grant vote
+		if args.LastLogTerm >= ourLastLogTerm {
+			grantVote = true
+		}
+		if args.LastLogTerm == ourLastLogTerm && args.LastLogIndex >= rf.commitIndex {
+			grantVote = true
+		}
+	}
+
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = grantVote
 }
 
 //
@@ -167,7 +197,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -188,7 +217,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -221,11 +249,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (2A, 2B, 2C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }

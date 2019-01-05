@@ -67,7 +67,7 @@ const (
 )
 
 // How often leader should send heartbeats
-const HeartbeatIntervalMs = 1
+const HeartbeatIntervalMs = 75
 
 // How long to wait for majority vote before halting election
 const ElectionWinTimeoutMs = 100
@@ -196,7 +196,7 @@ func (rf *Raft) HeartbeatTimeout() {
 	heartbeatTimeChan := make(chan int)
 	go func(heartbeatTimeChan chan int) {
 		for {
-			time.Sleep(time.Duration(10) * time.Millisecond)
+			time.Sleep(time.Duration(HeartbeatIntervalMs) * time.Millisecond)
 			heartbeatTimeChan <- 1
 		}
 	}(heartbeatTimeChan)
@@ -222,7 +222,7 @@ func (rf *Raft) HeartbeatTimeout() {
 
 				// DPrintf("[%d] sending heartbeat to %d", rf.me, i)
 				go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, me int, heartbeatChan chan HeartbeatInfo) {
-					args := AppendEntriesArgs{rf.currentTerm, rf.me}
+					args := AppendEntriesArgs{currentTerm, me}
 					var reply AppendEntriesReply
 					ok := peer.Call("Raft.AppendEntries", &args, &reply)
 					heartbeatInfo := HeartbeatInfo{ok, &reply, currentTerm, peerId}
@@ -381,7 +381,7 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 
 				DPrintf("new leader [%d] sending heartbeat to %d", rf.me, i)
 				go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, me int, heartbeatChan chan HeartbeatInfo) {
-					args := AppendEntriesArgs{rf.currentTerm, rf.me}
+					args := AppendEntriesArgs{currentTerm, me}
 					var reply AppendEntriesReply
 					ok := peer.Call("Raft.AppendEntries", &args, &reply)
 					heartbeatInfo := HeartbeatInfo{ok, &reply, currentTerm, peerId}

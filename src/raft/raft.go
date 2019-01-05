@@ -151,7 +151,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Check if we haven't voted for anyone or already for this candidate
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		// Check that candidate's log is at least as up-to-date as receiver's log, grant vote
-		if args.LastLogTerm >= ourLastLogTerm {
+		if args.LastLogTerm > ourLastLogTerm {
 			grantVote = true
 		}
 		if args.LastLogTerm == ourLastLogTerm && args.LastLogIndex >= rf.commitIndex {

@@ -69,7 +69,7 @@ const (
 // How often leader should send heartbeats
 const HeartbeatIntervalMs = 75
 
-// How long to wait for majority vote before halting election
+// How long candidate should wait for majority vote before halting election
 const ElectionWinTimeoutMs = 100
 
 // Minimum and maximum range to randomly choose election timeouts from
@@ -90,10 +90,14 @@ type Raft struct {
 	votedFor           int                // CandidateId that received vote in current term, or null if none
 	commitIndex        int                // Highest log entry known to be committed
 	lastApplied        int                // Highest log entry applied to current state machine
-	state              int                // Current state: follower, candidate, or leader
+	state              int                // Current state, one of {follower, candidate, leader}
 	lastHeartbeatNano  int64              // Last timestamp received from a valid leader, in nanoseconds
 	electionTimeoutMs  int                // Election timeout, in ms
 	heartbeatReplyChan chan HeartbeatInfo // In shared struct so can send heartbeats immediately after becoming leader without waiting for next interval
+}
+
+type LogEntry struct {
+	term int
 }
 
 // Stores info about results of RequestVote invocation
@@ -190,6 +194,34 @@ type AppendEntriesReply struct {
 	Term int // later term for leader to update itself
 }
 
+// precondition: rf.mu is locked
+func (rf *Raft) sendAllHeartbeats() {
+	// Send AppendEntries heartbeat to every peer
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, me int, heartbeatChan chan HeartbeatInfo) {
+			args := AppendEntriesArgs{currentTerm, me}
+			var reply AppendEntriesReply
+			ok := peer.Call("Raft.AppendEntries", &args, &reply)
+			heartbeatInfo := HeartbeatInfo{ok, &reply, currentTerm, peerId}
+			heartbeatChan <- heartbeatInfo
+		}(rf.currentTerm, rf.peers[i], i, rf.me, rf.heartbeatReplyChan)
+	}
+}
+
+// precondition: rf.mu is locked
+// Usually called when we get a RPC reply with a higher term, which means we should immediately move to follower state
+// Also provide new leader, or -1 if not known (which happens if we got heartbeat back with higher term without new leader info)
+func (rf *Raft) moveToNewTerm(newTerm int, newLeader int) {
+	rf.currentTerm = newTerm
+	rf.currentLeader = newLeader
+	rf.votedFor = -1         // since we're moving to this term, we by definition haven't voted for anyone yet
+	rf.state = FollowerState // anytime we move to new term we move to follower state, except when we increment term after detecting leader failure and becoming candidate
+}
+
 func (rf *Raft) HeartbeatTimeout() {
 	// QUESTION: should we wait here for reply/timeout from all heartbeat requests? or, should we also move on to next heartbeat timeout? => yes, because the followers that did reply will trigger election timeout if another follower hasn't replied
 
@@ -214,30 +246,13 @@ func (rf *Raft) HeartbeatTimeout() {
 				break
 			}
 
-			// Send AppendEntries heartbeat to every peer
-			for i, _ := range rf.peers {
-				if i == rf.me {
-					continue
-				}
-
-				// DPrintf("[%d] sending heartbeat to %d", rf.me, i)
-				go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, me int, heartbeatChan chan HeartbeatInfo) {
-					args := AppendEntriesArgs{currentTerm, me}
-					var reply AppendEntriesReply
-					ok := peer.Call("Raft.AppendEntries", &args, &reply)
-					heartbeatInfo := HeartbeatInfo{ok, &reply, currentTerm, peerId}
-					heartbeatChan <- heartbeatInfo
-				}(rf.currentTerm, rf.peers[i], i, rf.me, rf.heartbeatReplyChan)
-			}
+			rf.sendAllHeartbeats()
 		case heartbeatInfo := <-rf.heartbeatReplyChan:
 			rf.mu.Lock()
 
 			// We are in old epoch, so update epoch and revert to follower
 			if heartbeatInfo.reply.Term > rf.currentTerm {
-				rf.currentTerm = heartbeatInfo.reply.Term
-				rf.currentLeader = -1
-				rf.votedFor = -1
-				rf.state = FollowerState
+				rf.moveToNewTerm(heartbeatInfo.reply.Term, -1)
 			}
 		}
 
@@ -328,9 +343,7 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 				// Peer has higher epoch, so halt election process and move back to follower
 				if voteInfo.reply.Term > rf.currentTerm {
 					DPrintf("[%d] got vote reply from %d but it has higher epoch, so halting election", rf.me, voteInfo.peerId)
-					rf.currentTerm = voteInfo.reply.Term
-					rf.state = FollowerState
-					rf.votedFor = -1
+					rf.moveToNewTerm(voteInfo.reply.Term, -1)
 					lostElection = true
 					break
 				}
@@ -374,20 +387,7 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 			DPrintf("[%d] received %d votes, becoming the leader", rf.me, votesReceived)
 
 			// Send heartbeat to every peer immediately after becoming leader
-			for i, _ := range rf.peers {
-				if i == rf.me {
-					continue
-				}
-
-				DPrintf("new leader [%d] sending heartbeat to %d", rf.me, i)
-				go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, me int, heartbeatChan chan HeartbeatInfo) {
-					args := AppendEntriesArgs{currentTerm, me}
-					var reply AppendEntriesReply
-					ok := peer.Call("Raft.AppendEntries", &args, &reply)
-					heartbeatInfo := HeartbeatInfo{ok, &reply, currentTerm, peerId}
-					heartbeatChan <- heartbeatInfo
-				}(rf.currentTerm, rf.peers[i], i, rf.me, rf.heartbeatReplyChan)
-			}
+			rf.sendAllHeartbeats()
 		}
 
 		// Didn't get enough votes, so go back to follower
@@ -421,10 +421,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else if args.Term > rf.currentTerm {
 		DPrintf("[%d] got heartbeat from newer term %d and leader %d, moving to follower", rf.me, args.Term, args.LeaderId)
 		// If from later epoch, update our epoch and move to follower state
-		rf.currentTerm = args.Term
-		rf.currentLeader = args.LeaderId
-		rf.votedFor = -1
-		rf.state = FollowerState
+		rf.moveToNewTerm(args.Term, args.LeaderId)
 	}
 
 	// DPrintf("[%d] got heartbeat from leader %d in term %d", rf.me, rf.currentLeader, rf.currentTerm)
@@ -448,10 +445,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// If from later epoch, update our epoch and move to follower state
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.currentLeader = -1
-		rf.state = FollowerState
+		rf.moveToNewTerm(args.Term, -1)
 	}
 
 	grantVote := false

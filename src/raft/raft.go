@@ -114,7 +114,13 @@ type HeartbeatInfo struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	return rf.currentTerm, rf.state == LeaderState
+	var term int
+	var isleader bool
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	isleader = rf.state == LeaderState
+	return term, isleader
 }
 
 //

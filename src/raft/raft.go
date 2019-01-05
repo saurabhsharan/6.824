@@ -347,6 +347,7 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 					wonElection = true
 				}
 			case <-winTimeoutChan:
+				rf.mu.Lock()
 				lostElection = true
 			}
 

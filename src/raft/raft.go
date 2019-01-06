@@ -33,15 +33,17 @@ package raft
 // Problem: strawman results in deadlock, as no one can respond to RPCs since they are waiting for reply from others, who are waiting for RPC on someone who is waiting for RPCs...
 // Idea: before making blocking RPC call, release lock, and in reply, get lock back and check that state is roughly the same
 
+// Overall locking philosophy: lock in scopes as large as possible (entire RPC method, RPC response handler, timer expiration), but don't lock while waiting (e.g. while calling `select` statement) and give up lock as close to blocking and as soon as possible after unblocking
+// Every blocking operation should be in its own goroutine
+
+// In future version: use channel as semaphore to limit number of outgoing RPC requests to prevent network  congestion/overload (needs to be priority-based though?)
+
 import (
 	"labrpc"
 	"math/rand"
 	"sync"
 	"time"
 )
-
-// import "bytes"
-// import "labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -98,6 +100,17 @@ type Raft struct {
 
 type LogEntry struct {
 	term int
+}
+
+// Encapsulates set of information to understand an arbitrary RPC reply.
+// Typically used to communicate back from a goroutine that made a blocking RPC call.
+type RPCInfo struct {
+	ok      bool        // Whether RPC returned ok
+	request interface{} // request data
+	reply   interface{} // reply data
+	method  string      // Name of RPC method
+	term    int         // Term RPC was sent in
+	peerId  int         // Peer RPC was sent to
 }
 
 // Stores info about results of RequestVote invocation
@@ -222,7 +235,7 @@ func (rf *Raft) moveToNewTerm(newTerm int, newLeader int) {
 	rf.state = FollowerState // anytime we move to new term we move to follower state, except when we increment term after detecting leader failure and becoming candidate
 }
 
-func (rf *Raft) HeartbeatTimeout() {
+func (rf *Raft) RunHeartbeat() {
 	// QUESTION: should we wait here for reply/timeout from all heartbeat requests? or, should we also move on to next heartbeat timeout? => yes, because the followers that did reply will trigger election timeout if another follower hasn't replied
 
 	heartbeatTimeChan := make(chan int)
@@ -448,17 +461,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.moveToNewTerm(args.Term, -1)
 	}
 
-	grantVote := false
-	// Check if we haven't voted for anyone or already for this candidate, and if there isn't already a leader we know about
-	if rf.currentLeader == -1 && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
-		// Check that candidate's log is at least as up-to-date as receiver's log, grant vote
-		if args.LastLogTerm > ourLastLogTerm {
-			grantVote = true
-		}
-		if args.LastLogTerm == ourLastLogTerm && args.LastLogIndex >= rf.commitIndex {
-			grantVote = true
-		}
-	}
+	noCurrentLeader := rf.currentLeader == -1
+	canVoteForCandidate := rf.votedFor == -1 || rf.votedFor == args.CandidateId
+	validLogVersion := (args.LastLogTerm > ourLastLogTerm) || (args.LastLogTerm == ourLastLogTerm && args.LastLogIndex >= rf.commitIndex)
+	grantVote := noCurrentLeader && canVoteForCandidate && validLogVersion
 
 	if grantVote {
 		DPrintf("[%d] voted for %d in term %d", rf.me, args.CandidateId, rf.currentTerm)
@@ -568,7 +574,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	DPrintf("[%d] has election timeout %d", rf.me, rf.electionTimeoutMs)
 	rf.heartbeatReplyChan = make(chan HeartbeatInfo)
 	go rf.ElectionTimeout(rf.electionTimeoutMs)
-	go rf.HeartbeatTimeout()
+	go rf.RunHeartbeat()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

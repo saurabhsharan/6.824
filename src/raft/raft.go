@@ -46,7 +46,6 @@ import (
 	"time"
 )
 
-//
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -56,7 +55,6 @@ import (
 // in Lab 3 you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh; at that point you can add fields to
 // ApplyMsg, but set CommandValid to false for these other uses.
-//
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -153,6 +151,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+}
+
+func Min(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // restore previously persisted state.
@@ -266,6 +271,15 @@ func (rf *Raft) RunHeartbeat() {
 
 		// Release lock before waiting on anything
 		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) CommitRemaining() {
+	if rf.commitIndex > rf.lastApplied {
+		rf.lastApplied += 1
+		DPrintf("[%d] committing entry %d", rf.me, rf.lastApplied)
+		msg := ApplyMsg{true, rf.log[rf.lastApplied].Command, rf.lastApplied + 1}
+		rf.applyChan <- msg
 	}
 }
 
@@ -444,10 +458,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 
 	// Update state from heartbeat
-	DPrintf("[%d] now knows that leader is %d in term %d", rf.me, args.LeaderId, rf.currentTerm)
+	// DPrintf("[%d] now knows that leader is %d in term %d", rf.me, args.LeaderId, rf.currentTerm)
 	rf.lastHeartbeatNano = time.Now().UnixNano()
 	rf.state = FollowerState
 	rf.currentLeader = args.LeaderId
+
+	if args.LeaderCommitIndex > rf.commitIndex {
+		rf.commitIndex = Min(len(rf.log)-1, args.LeaderCommitIndex)
+		rf.CommitRemaining()
+	}
 
 	// Return if no data to append (i.e. was only heartbeat request)
 	if len(args.Entries) == 0 {
@@ -492,6 +511,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.log = append(rf.log, args.Entries[(len(args.Entries)-numMissing):]...)
 	}
 
+	DPrintf("[%d] accepted/replicated %d entries starting at %d, term %d", rf.me, numMissing, args.PrevLogIndex+1, rf.currentTerm)
 	reply.Success = true
 }
 
@@ -558,6 +578,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.log = append(rf.log, LogEntry{term, command})
 
+	DPrintf("[%d] adding new log entry at index %d, term %d", rf.me, index, term)
+
 	for i, _ := range rf.peers {
 		if i == rf.me {
 			continue
@@ -579,7 +601,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}(rf.currentTerm, rf.peers[i], i, args, rf.appendEntriesResponseChan)
 	}
 
-	return index, term, isLeader
+	// Tests expect 1-indexed log, consistent with Raft paper
+	return index + 1, term, isLeader
 }
 
 func (rf *Raft) AppendEntriesResponseHandler() {
@@ -620,12 +643,14 @@ func (rf *Raft) AppendEntriesResponseHandler() {
 			}
 
 			if response.Success {
+				DPrintf("[%d] got success AppendEntries response from %d", rf.me, peer)
 				newMatchIndex := args.PrevLogIndex + len(args.Entries)
 				if newMatchIndex > rf.matchIndex[peer] {
 					rf.matchIndex[peer] = newMatchIndex
 					rf.nextIndex[peer] = newMatchIndex + 1
 				}
 			} else {
+				DPrintf("[%d] got error AppendEntries response from %d", rf.me, peer)
 				// Conflict at args.PrevLogIndex (or follower didn't have anything there), so decrement nextIndex[peer] and try again
 				// Actually, always safe to send AppendEntries() that won't delete date (since AppendEntries is idempotent) WRONG but actually, not safe to decrement rf.nextIndex[peer]!
 				// If there was a conflict, we may have solved it through later RPCs
@@ -645,7 +670,7 @@ func (rf *Raft) AppendEntriesResponseHandler() {
 						ok := peer.Call("Raft.AppendEntries", &args, &reply)
 						appendEntriesContext := AppendEntriesContext{ok, &args, &reply, currentTerm, peerId}
 						responseChan <- appendEntriesContext
-					}(rf.currentTerm, rf.peers[peer], i, args, rf.appendEntriesResponseChan)
+					}(rf.currentTerm, rf.peers[peer], peer, args, rf.appendEntriesResponseChan)
 				}
 			}
 
@@ -661,7 +686,9 @@ func (rf *Raft) AppendEntriesResponseHandler() {
 					}
 				}
 				if numMatching >= ((len(rf.peers) / 2) + 1) {
+					DPrintf("[%d] commiting entries through %d", rf.me, logIndex)
 					rf.commitIndex = logIndex
+					rf.CommitRemaining()
 					break
 				}
 			}
@@ -717,6 +744,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimeoutMs = rand.Intn(ElectionTimeoutMaxMs-ElectionTimeoutMinMs) + ElectionTimeoutMinMs
 	DPrintf("[%d] has election timeout %d", rf.me, rf.electionTimeoutMs)
 	rf.heartbeatReplyChan = make(chan AppendEntriesContext)
+	rf.appendEntriesResponseChan = make(chan AppendEntriesContext)
 	go rf.ElectionTimeout(rf.electionTimeoutMs)
 	go rf.RunHeartbeat()
 	go rf.AppendEntriesResponseHandler()

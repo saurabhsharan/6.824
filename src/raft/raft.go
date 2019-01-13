@@ -226,6 +226,36 @@ func (rf *Raft) sendAllHeartbeats() {
 }
 
 // Precondition: rf.mu is locked
+func (rf *Raft) sendMissingEntries() {
+	// DPrintf("[%d] sendMissingEntries", rf.me)
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		entriesToSend := rf.log[(rf.nextIndex[i]):]
+		DPrintf("[%d] sending %v to %d", rf.me, entriesToSend, i)
+		// if len(entriesToSend) == 0 {
+		//     continue
+		// }
+
+		prevLogIndex := rf.nextIndex[i] - 1
+		prevLogTerm := -1
+		if prevLogIndex >= 0 {
+			prevLogTerm = rf.log[prevLogIndex].Term
+		}
+		args := AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, entriesToSend, rf.commitIndex}
+
+		go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, args AppendEntriesArgs, responseChan chan AppendEntriesContext) {
+			var reply AppendEntriesReply
+			ok := peer.Call("Raft.AppendEntries", &args, &reply)
+			appendEntriesContext := AppendEntriesContext{ok, &args, &reply, currentTerm, peerId}
+			responseChan <- appendEntriesContext
+		}(rf.currentTerm, rf.peers[i], i, args, rf.appendEntriesResponseChan)
+	}
+}
+
+// Precondition: rf.mu is locked
 // Usually called when we get a RPC reply with a higher term, which means we should immediately move to follower state
 // Also provide new leader, or -1 if not known (which happens if we got heartbeat back with higher term without new leader info)
 func (rf *Raft) moveToNewTerm(newTerm int, newLeader int) {
@@ -238,7 +268,7 @@ func (rf *Raft) moveToNewTerm(newTerm int, newLeader int) {
 func (rf *Raft) RunHeartbeat() {
 	// QUESTION: should we wait here for reply/timeout from all heartbeat requests? or, should we also move on to next heartbeat timeout? => yes, because the followers that did reply will trigger election timeout if another follower hasn't replied
 
-	heartbeatTimeChan := make(chan int)
+	heartbeatTimeChan := make(chan int, 100)
 	go func(heartbeatTimeChan chan int) {
 		for {
 			time.Sleep(time.Duration(HeartbeatIntervalMs) * time.Millisecond)
@@ -253,15 +283,17 @@ func (rf *Raft) RunHeartbeat() {
 		select {
 		case <-heartbeatTimeChan:
 			rf.mu.Lock()
+			// DPrintf("[%d] got heartbeatTIMEChan lock", rf.me)
 
 			// Not leader, so don't do anything
 			if rf.state != LeaderState {
 				break
 			}
 
-			rf.sendAllHeartbeats()
+			rf.sendMissingEntries()
 		case heartbeatInfo := <-rf.heartbeatReplyChan:
 			rf.mu.Lock()
+			// DPrintf("[%d] got heartbeatREPLYchan lock", rf.me)
 
 			// We are in old epoch, so update epoch and revert to follower
 			if heartbeatInfo.reply.Term > rf.currentTerm {
@@ -275,7 +307,7 @@ func (rf *Raft) RunHeartbeat() {
 }
 
 func (rf *Raft) CommitRemaining() {
-	if rf.commitIndex > rf.lastApplied {
+	for rf.commitIndex > rf.lastApplied {
 		rf.lastApplied += 1
 		DPrintf("[%d] committing entry %d", rf.me, rf.lastApplied)
 		msg := ApplyMsg{true, rf.log[rf.lastApplied].Command, rf.lastApplied + 1}
@@ -285,9 +317,10 @@ func (rf *Raft) CommitRemaining() {
 
 func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 	for {
-		time.Sleep(time.Duration(electionTimeoutMs/2) * time.Millisecond)
+		time.Sleep(time.Duration(electionTimeoutMs) * time.Millisecond)
 
 		rf.mu.Lock()
+		// DPrintf("[%d] got election timeout lock", rf.me)
 
 		// If we are leader, nothing to do (sending heartbeat is handled by different goroutine)
 		if rf.state == LeaderState {
@@ -310,7 +343,7 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 		DPrintf("[%d] hit election timeout, starting election, new term is %d", rf.me, rf.currentTerm)
 
 		// Make channel that goroutines can write their output to
-		votesInfoChan := make(chan RequestVoteContext)
+		votesInfoChan := make(chan RequestVoteContext, 100)
 
 		// For every peer, spawn a goroutine that sends a vote request to that peer and writes output to channel
 		for i, _ := range rf.peers {
@@ -335,7 +368,7 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 		}
 
 		// Create channel and goroutine to stop election if we haven't won within 100 ms
-		winTimeoutChan := make(chan int)
+		winTimeoutChan := make(chan int, 100)
 		go func() {
 			time.Sleep(time.Duration(ElectionWinTimeoutMs) * time.Millisecond)
 			winTimeoutChan <- 1
@@ -345,7 +378,7 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 		votesReceived := 1
 		votesDeclined := 0
 
-		// Release lock after spwaning all RPC goroutines
+		// Release lock after spawning all RPC goroutines
 		rf.mu.Unlock()
 
 		// Flag variables that inner code blocks within select{} may set to indicate that election is over (either won or lost)
@@ -359,6 +392,7 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 			case voteInfo := <-votesInfoChan:
 				// Check for any state changes between RPC request and response
 				rf.mu.Lock()
+				// DPrintf("[%d] got votesInfoChan lock", rf.me)
 
 				// If no longer in candidate state, then halt election
 				// This assumes that any epoch changes would have also resulted in moving away from candidate state. Maybe also include explicit epoch check as well?
@@ -395,6 +429,7 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 				}
 			case <-winTimeoutChan:
 				rf.mu.Lock()
+				// DPrintf("[%d] got winTimeoutChan lock", rf.me)
 				lostElection = true
 			}
 
@@ -425,12 +460,14 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 			}
 
 			// Send heartbeat to every peer immediately after becoming leader
-			rf.sendAllHeartbeats()
+			// rf.sendAllHeartbeats()
+			rf.sendMissingEntries()
 		}
 
 		// Didn't get enough votes, so go back to follower
 		if lostElection {
 			rf.state = FollowerState
+			rf.lastHeartbeatNano = time.Now().UnixNano()
 			DPrintf("[%d] didn't get enough votes, going back to follower", rf.me)
 		}
 
@@ -440,7 +477,9 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 
 // AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// DPrintf("[%d] AppendEntries() pre-lock", rf.me)
 	rf.mu.Lock()
+	// DPrintf("[%d] AppendEntries() post-lock", rf.me)
 	defer rf.mu.Unlock()
 
 	// Some other node has conflicting leader for the same epoch; for now, consider this a fatal error,but could have better recovery strategy
@@ -452,9 +491,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Reject requests from earlier epoch (in particular, requests from old leaders) and reply with our epoch
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		DPrintf("AppendEntries error A")
+		DPrintf("[%d] AppendEntries error A", rf.me)
 		reply.Success = false
 		return
+	}
+
+	if args.Term == rf.currentTerm {
+		rf.lastHeartbeatNano = time.Now().UnixNano()
 	}
 
 	// If request is from later epoch, move forward our epoch and transition to follower state
@@ -467,19 +510,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Update state from heartbeat
 	// DPrintf("[%d] now knows that leader is %d in term %d", rf.me, args.LeaderId, rf.currentTerm)
-	rf.lastHeartbeatNano = time.Now().UnixNano()
+
 	rf.state = FollowerState
 	rf.currentLeader = args.LeaderId
-
-	if args.LeaderCommitIndex > rf.commitIndex {
-		rf.commitIndex = Min(len(rf.log)-1, args.LeaderCommitIndex)
-		rf.CommitRemaining()
-	}
-
-	// Return if no data to append (i.e. was only heartbeat request)
-	if len(args.Entries) == 0 {
-		return
-	}
 
 	// No log entry at args.prevLogIndex, so return failure
 	if args.PrevLogIndex >= len(rf.log) {
@@ -492,6 +525,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		DPrintf("AppendEntries error C")
 		reply.Success = false
+		return
+	}
+
+	// Return if no data to append (i.e. was only heartbeat request)
+	if len(args.Entries) == 0 {
+		if args.LeaderCommitIndex > rf.commitIndex {
+			rf.commitIndex = Min(len(rf.log)-1, args.LeaderCommitIndex)
+			DPrintf("CommitRemaining A")
+			rf.CommitRemaining()
+		}
+		reply.Success = true
 		return
 	}
 
@@ -521,16 +565,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.log = append(rf.log, args.Entries[(len(args.Entries)-numMissing):]...)
 	}
 
+	if args.LeaderCommitIndex > rf.commitIndex {
+		rf.commitIndex = Min(len(rf.log)-1, args.LeaderCommitIndex)
+		DPrintf("CommitRemaining B")
+		rf.CommitRemaining()
+	}
+
 	DPrintf("[%d] accepted/replicated %d entries starting at %d, term %d", rf.me, numMissing, args.PrevLogIndex+1, rf.currentTerm)
 	reply.Success = true
 }
 
 // RequestVote RPC handler
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// DPrintf("[%d] just entered RequestVote to respond to %d", rf.me, args.CandidateId)
 	rf.mu.Lock()
+	// DPrintf("[%d] just got RequestVote lock to respond to %d", rf.me, args.CandidateId)
 	defer rf.mu.Unlock()
 
-	DPrintf("[%d] received RequestVote from %d", rf.me, args.CandidateId)
+	// DPrintf("[%d] received RequestVote from %d", rf.me, args.CandidateId)
 
 	// Reject requests from earlier epoch and reply with our epoch
 	if args.Term < rf.currentTerm {
@@ -558,6 +610,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if grantVote {
 		DPrintf("[%d] voted for %d in term %d (args.LastLogTerm = %d, ourLastLogTerm = %d, log = %v)", rf.me, args.CandidateId, rf.currentTerm, args.LastLogTerm, ourLastLogTerm, rf.log)
 		rf.votedFor = args.CandidateId
+		rf.lastHeartbeatNano = time.Now().UnixNano()
 	}
 
 	reply.Term = rf.currentTerm
@@ -580,6 +633,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
+	// DPrintf("[%d] got Start() lock", rf.me)
 	defer rf.mu.Unlock()
 
 	isLeader := rf.state == LeaderState
@@ -594,28 +648,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, LogEntry{term, command})
 
 	DPrintf("[%d] matchIndex: %v", rf.me, rf.matchIndex)
-	DPrintf("[%d] adding new log entry at index %d, term %d", rf.me, index, term)
+	DPrintf("[%d] adding new log entry at index %d, term %d, value %v", rf.me, index, term, command)
 
-	for i, _ := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-
-		entriesToSend := rf.log[(rf.nextIndex[i]):]
-		prevLogIndex := rf.nextIndex[i] - 1
-		prevLogTerm := -1
-		if prevLogIndex >= 0 {
-			prevLogTerm = rf.log[prevLogIndex].Term
-		}
-		args := AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, entriesToSend, rf.commitIndex}
-
-		go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, args AppendEntriesArgs, responseChan chan AppendEntriesContext) {
-			var reply AppendEntriesReply
-			ok := peer.Call("Raft.AppendEntries", &args, &reply)
-			appendEntriesContext := AppendEntriesContext{ok, &args, &reply, currentTerm, peerId}
-			responseChan <- appendEntriesContext
-		}(rf.currentTerm, rf.peers[i], i, args, rf.appendEntriesResponseChan)
-	}
+	rf.sendMissingEntries()
 
 	// Tests expect 1-indexed log, consistent with Raft paper
 	return index + 1, term, isLeader
@@ -626,9 +661,10 @@ func (rf *Raft) AppendEntriesResponseHandler() {
 		select {
 		case appendEntriesContext := <-rf.appendEntriesResponseChan:
 			rf.mu.Lock()
+			// DPrintf("[%d] acquired lock in AppendEntriesResponseHandler", rf.me)
 
 			if !appendEntriesContext.ok {
-				continue
+				break
 			}
 
 			// 3 terms: (A) term request was sent (B) term in response (C) term we are in
@@ -645,21 +681,21 @@ func (rf *Raft) AppendEntriesResponseHandler() {
 			// If response is from future epoch, move forward our epoch and transition to follower
 			if response.Term > rf.currentTerm {
 				rf.moveToNewTerm(appendEntriesContext.reply.Term, -1)
-				continue
+				break
 			}
 
 			// If response is for request from previous epoch, ignore
 			if response.Term < rf.currentTerm {
-				continue
+				break
 			}
 
 			// Response is rejection since request was stale and got rejected
 			if appendEntriesContext.term < response.Term {
-				continue
+				break
 			}
 
 			if response.Success {
-				DPrintf("[%d] got success AppendEntries response from %d", rf.me, peer)
+				// DPrintf("[%d] got success AppendEntries response from %d", rf.me, peer)
 				newMatchIndex := args.PrevLogIndex + len(args.Entries)
 				if newMatchIndex > rf.matchIndex[peer] {
 					rf.matchIndex[peer] = newMatchIndex
@@ -703,16 +739,17 @@ func (rf *Raft) AppendEntriesResponseHandler() {
 						numMatching += 1
 					}
 				}
-				if numMatching >= ((len(rf.peers) / 2) + 1) {
+				if numMatching >= ((len(rf.peers)/2)+1) && rf.log[logIndex].Term == rf.currentTerm {
 					DPrintf("[%d] commiting entries through %d", rf.me, logIndex)
 					rf.commitIndex = logIndex
+					DPrintf("CommitRemaining C")
 					rf.CommitRemaining()
 					break
 				}
 			}
-		default:
-			rf.mu.Lock()
-			rf.CommitRemaining()
+			// default:
+			//     rf.mu.Lock()
+			//     rf.CommitRemaining()
 		}
 
 		rf.mu.Unlock()
@@ -764,7 +801,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rand.Seed(time.Now().UnixNano())
 	rf.electionTimeoutMs = rand.Intn(ElectionTimeoutMaxMs-ElectionTimeoutMinMs) + ElectionTimeoutMinMs
 	DPrintf("[%d] has election timeout %d", rf.me, rf.electionTimeoutMs)
-	rf.heartbeatReplyChan = make(chan AppendEntriesContext)
+	rf.heartbeatReplyChan = make(chan AppendEntriesContext, 100)
 	rf.appendEntriesResponseChan = make(chan AppendEntriesContext, 100)
 	go rf.ElectionTimeout(rf.electionTimeoutMs)
 	go rf.RunHeartbeat()

@@ -67,15 +67,15 @@ const (
 	LeaderState    = iota
 )
 
-// How often leader should send heartbeats
-const HeartbeatIntervalMs = 75
+// How often leader should send heartbeats, must be no more than 10/sec
+const HeartbeatIntervalMs = 100
 
 // How long candidate should wait for majority vote before halting election
-const ElectionWinTimeoutMs = 100
+const ElectionWinTimeoutMs = 200
 
 // Minimum and maximum range to randomly choose election timeouts from
-const ElectionTimeoutMinMs = 500
-const ElectionTimeoutMaxMs = 800
+const ElectionTimeoutMinMs = 800
+const ElectionTimeoutMaxMs = 1500
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -319,13 +319,19 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 				continue
 			}
 
-			go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, me int, lastApplied int, votesInfoChan chan RequestVoteContext) {
-				args := RequestVoteArgs{currentTerm, me, lastApplied, currentTerm}
+			lastLogIndex := len(rf.log) - 1
+			lastLogTerm := -1
+			if lastLogIndex >= 0 {
+				lastLogTerm = rf.log[lastLogIndex].Term
+			}
+
+			go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, me int, lastLogIndex int, lastLogTerm int, votesInfoChan chan RequestVoteContext) {
+				args := RequestVoteArgs{currentTerm, me, lastLogIndex, lastLogTerm}
 				var reply RequestVoteReply
 				ok := peer.Call("Raft.RequestVote", &args, &reply)
 				voteContext := RequestVoteContext{ok, &reply, currentTerm, peerId}
 				votesInfoChan <- voteContext
-			}(rf.currentTerm, rf.peers[i], i, rf.me, rf.lastApplied, votesInfoChan)
+			}(rf.currentTerm, rf.peers[i], i, rf.me, lastLogIndex, lastLogTerm, votesInfoChan)
 		}
 
 		// Create channel and goroutine to stop election if we haven't won within 100 ms
@@ -406,6 +412,7 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 		// Become the leader
 		if wonElection {
 			DPrintf("[%d] received %d votes, becoming the leader", rf.me, votesReceived)
+			DPrintf("[%d] log: %v", rf.me, rf.log)
 			rf.state = LeaderState
 
 			// Initialize rf.nextIndex and rf.matchIndex
@@ -445,6 +452,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Reject requests from earlier epoch (in particular, requests from old leaders) and reply with our epoch
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
+		DPrintf("AppendEntries error A")
 		reply.Success = false
 		return
 	}
@@ -475,12 +483,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// No log entry at args.prevLogIndex, so return failure
 	if args.PrevLogIndex >= len(rf.log) {
+		DPrintf("[%d] AppendEntries error B, args.PrevLogIndex = %d, rf.log = %v", rf.me, args.PrevLogIndex, rf.log)
 		reply.Success = false
 		return
 	}
 
 	// Terms don't match, hence entries don't match, so return failure
 	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		DPrintf("AppendEntries error C")
 		reply.Success = false
 		return
 	}
@@ -520,6 +530,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	DPrintf("[%d] received RequestVote from %d", rf.me, args.CandidateId)
+
 	// Reject requests from earlier epoch and reply with our epoch
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -528,7 +540,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// Save current term, which is compared to args.LastLogTerm (since we don't store that in rf state)
-	ourLastLogTerm := rf.currentTerm
+	ourLastLogTerm := -1
+	if len(rf.log) > 0 {
+		ourLastLogTerm = rf.log[len(rf.log)-1].Term
+	}
 
 	// If request is from later epoch, move forward our epoch and transition to follower
 	if args.Term > rf.currentTerm {
@@ -537,11 +552,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	noCurrentLeader := rf.currentLeader == -1
 	canVoteForCandidate := rf.votedFor == -1 || rf.votedFor == args.CandidateId
-	validLogVersion := (args.LastLogTerm > ourLastLogTerm) || (args.LastLogTerm == ourLastLogTerm && args.LastLogIndex >= rf.commitIndex)
+	validLogVersion := (args.LastLogTerm > ourLastLogTerm) || (args.LastLogTerm == ourLastLogTerm && args.LastLogIndex >= (len(rf.log)-1))
 	grantVote := noCurrentLeader && canVoteForCandidate && validLogVersion
 
 	if grantVote {
-		DPrintf("[%d] voted for %d in term %d", rf.me, args.CandidateId, rf.currentTerm)
+		DPrintf("[%d] voted for %d in term %d (args.LastLogTerm = %d, ourLastLogTerm = %d, log = %v)", rf.me, args.CandidateId, rf.currentTerm, args.LastLogTerm, ourLastLogTerm, rf.log)
 		rf.votedFor = args.CandidateId
 	}
 
@@ -578,6 +593,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.log = append(rf.log, LogEntry{term, command})
 
+	DPrintf("[%d] matchIndex: %v", rf.me, rf.matchIndex)
 	DPrintf("[%d] adding new log entry at index %d, term %d", rf.me, index, term)
 
 	for i, _ := range rf.peers {
@@ -654,28 +670,30 @@ func (rf *Raft) AppendEntriesResponseHandler() {
 				// Conflict at args.PrevLogIndex (or follower didn't have anything there), so decrement nextIndex[peer] and try again
 				// Actually, always safe to send AppendEntries() that won't delete date (since AppendEntries is idempotent) WRONG but actually, not safe to decrement rf.nextIndex[peer]!
 				// If there was a conflict, we may have solved it through later RPCs
-				if args.PrevLogIndex < rf.matchIndex[peer] {
-					rf.nextIndex[peer] -= 1
+				// if args.PrevLogIndex < rf.matchIndex[peer] {
+				rf.nextIndex[peer] -= 1
 
-					// Resend request with new nextIndex
-					entriesToSend := rf.log[(rf.nextIndex[peer]):]
-					prevLogIndex := rf.nextIndex[peer] - 1
-					prevLogTerm := -1
-					if prevLogIndex >= 0 {
-						prevLogTerm = rf.log[prevLogIndex].Term
-					}
-					args := AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, entriesToSend, rf.commitIndex}
-					go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, args AppendEntriesArgs, responseChan chan AppendEntriesContext) {
-						var reply AppendEntriesReply
-						ok := peer.Call("Raft.AppendEntries", &args, &reply)
-						appendEntriesContext := AppendEntriesContext{ok, &args, &reply, currentTerm, peerId}
-						responseChan <- appendEntriesContext
-					}(rf.currentTerm, rf.peers[peer], peer, args, rf.appendEntriesResponseChan)
+				// Resend request with new nextIndex
+				entriesToSend := rf.log[(rf.nextIndex[peer]):]
+				prevLogIndex := rf.nextIndex[peer] - 1
+				prevLogTerm := -1
+				if prevLogIndex >= 0 {
+					prevLogTerm = rf.log[prevLogIndex].Term
 				}
+				DPrintf("[%d] re-sending AppendEntries to %d with nextIndex =  %d", rf.me, peer, rf.nextIndex[peer])
+				args := AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, entriesToSend, rf.commitIndex}
+				go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, args AppendEntriesArgs, responseChan chan AppendEntriesContext) {
+					var reply AppendEntriesReply
+					ok := peer.Call("Raft.AppendEntries", &args, &reply)
+					appendEntriesContext := AppendEntriesContext{ok, &args, &reply, currentTerm, peerId}
+					responseChan <- appendEntriesContext
+				}(rf.currentTerm, rf.peers[peer], peer, args, rf.appendEntriesResponseChan)
+				// }
 			}
 
 			for logIndex := len(rf.log) - 1; logIndex > rf.commitIndex; logIndex-- {
 				numMatching := 0
+				DPrintf("[%d] matchIndex: %v", rf.me, rf.matchIndex)
 				for peer, _ := range rf.peers {
 					if peer == rf.me {
 						numMatching += 1
@@ -692,6 +710,9 @@ func (rf *Raft) AppendEntriesResponseHandler() {
 					break
 				}
 			}
+		default:
+			rf.mu.Lock()
+			rf.CommitRemaining()
 		}
 
 		rf.mu.Unlock()
@@ -744,7 +765,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimeoutMs = rand.Intn(ElectionTimeoutMaxMs-ElectionTimeoutMinMs) + ElectionTimeoutMinMs
 	DPrintf("[%d] has election timeout %d", rf.me, rf.electionTimeoutMs)
 	rf.heartbeatReplyChan = make(chan AppendEntriesContext)
-	rf.appendEntriesResponseChan = make(chan AppendEntriesContext)
+	rf.appendEntriesResponseChan = make(chan AppendEntriesContext, 100)
 	go rf.ElectionTimeout(rf.electionTimeoutMs)
 	go rf.RunHeartbeat()
 	go rf.AppendEntriesResponseHandler()

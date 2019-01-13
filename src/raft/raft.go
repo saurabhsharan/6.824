@@ -90,12 +90,13 @@ type Raft struct {
 	state int // Current state, one of {FollowerState, CandidateState, LeaderState}
 
 	// Election-related state
-	currentTerm        int                // Latest term seen
-	currentLeader      int                // Index of leader for current term, or -1 if none elected yet
-	votedFor           int                // CandidateId that received vote in current term, or -1 if none voted for yet
-	electionTimeoutMs  int                // Election timeout, in ms
-	lastHeartbeatNano  int64              // Timestamp of last heartbeat received from a valid leader, in unix time nanoseconds
-	heartbeatReplyChan chan HeartbeatInfo // In shared struct so can send heartbeats immediately after becoming leader without waiting for next interval
+	currentTerm               int                       // Latest term seen
+	currentLeader             int                       // Index of leader for current term, or -1 if none elected yet
+	votedFor                  int                       // CandidateId that received vote in current term, or -1 if none voted for yet
+	electionTimeoutMs         int                       // Election timeout, in ms
+	lastHeartbeatNano         int64                     // Timestamp of last heartbeat received from a valid leader, in unix time nanoseconds
+	heartbeatReplyChan        chan AppendEntriesContext // In shared struct so can send heartbeats immediately after becoming leader without waiting for next interval
+	appendEntriesResponseChan chan AppendEntriesContext // Single goroutine that handles all responses
 
 	// Log state
 	log         []LogEntry // Log
@@ -104,23 +105,12 @@ type Raft struct {
 
 	// Leader state
 	nextIndex  []int // Next index to insert new entries on each follower's log. This is decremented if AppendEntries consistency check fails, and increased as AppendEntries calls succeed. Initialize to the last log index + 1 (i.e. start by assuming that all followers logs are consistent).
-	matchIndex []int // Highest matching log index for each follower. This is monotonically increasing, and only changes (increases) when AppendEntries from leader to follower succeed. Initialized to 0.
+	matchIndex []int // Highest matching log index for each follower. This is monotonically increasing, and only changes (increases) when AppendEntries from leader to follower succeed. Initialized to - 1 (i.e. assume ).
 }
 
 type LogEntry struct {
 	Term    int
 	Command interface{}
-}
-
-// Encapsulates set of information to understand an arbitrary RPC reply.
-// Typically used to communicate back from a goroutine that made a blocking RPC call.
-type RPCInfo struct {
-	ok      bool        // Whether RPC returned ok
-	request interface{} // request data
-	reply   interface{} // reply data
-	method  string      // Name of RPC method
-	term    int         // Term RPC was sent in
-	peerId  int         // Peer RPC was sent to
 }
 
 // Stores info about results of RequestVote invocation
@@ -131,8 +121,9 @@ type RequestVoteContext struct {
 	peerId int               // Peer RPC was sent to
 }
 
-type HeartbeatInfo struct {
+type AppendEntriesContext struct {
 	ok     bool                // Whether RPC returned ok
+	args   *AppendEntriesArgs  // args/request data
 	reply  *AppendEntriesReply // reply data
 	term   int                 // Term RPC was sent in
 	peerId int                 // Peer RPC was sent to
@@ -219,11 +210,11 @@ func (rf *Raft) sendAllHeartbeats() {
 			continue
 		}
 
-		go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, me int, commitIndex int, heartbeatChan chan HeartbeatInfo) {
+		go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, me int, commitIndex int, heartbeatChan chan AppendEntriesContext) {
 			args := AppendEntriesArgs{currentTerm, me, -1, -1, make([]LogEntry, 0), commitIndex}
 			var reply AppendEntriesReply
 			ok := peer.Call("Raft.AppendEntries", &args, &reply)
-			heartbeatInfo := HeartbeatInfo{ok, &reply, currentTerm, peerId}
+			heartbeatInfo := AppendEntriesContext{ok, &args, &reply, currentTerm, peerId}
 			heartbeatChan <- heartbeatInfo
 		}(rf.currentTerm, rf.peers[i], i, rf.me, rf.commitIndex, rf.heartbeatReplyChan)
 	}
@@ -431,6 +422,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// Some other node has conflicting leader for the same epoch; for now, consider this a fatal error,but could have better recovery strategy
+	if args.Term == rf.currentTerm && rf.currentLeader != -1 && rf.currentLeader != args.LeaderId {
+		DPrintf("FATAL: Received AppendEntries in epoch %d with leader %d, but current node leader was %d", rf.currentTerm, args.LeaderId, rf.currentLeader)
+		os.Exit(-1)
+	}
+
 	// Reject requests from earlier epoch (in particular, requests from old leaders) and reply with our epoch
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -438,24 +435,64 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.lastHeartbeatNano = time.Now().UnixNano()
-
 	// If request is from later epoch, move forward our epoch and transition to follower state
 	if args.Term > rf.currentTerm {
 		DPrintf("[%d] got heartbeat from newer term %d and leader %d, moving to follower", rf.me, args.Term, args.LeaderId)
 		rf.moveToNewTerm(args.Term, args.LeaderId)
+	}
+
+	reply.Term = rf.currentTerm
+
+	// Update state from heartbeat
+	DPrintf("[%d] now knows that leader is %d in term %d", rf.me, args.LeaderId, rf.currentTerm)
+	rf.lastHeartbeatNano = time.Now().UnixNano()
+	rf.state = FollowerState
+	rf.currentLeader = args.LeaderId
+
+	// Return if no data to append (i.e. was only heartbeat request)
+	if len(args.Entries) == 0 {
 		return
 	}
 
-	// Some other node has conflicting leader for the same epoch; for now, consider this a fatal error,but could have better recovery strategy
-	if rf.currentLeader != -1 && rf.currentLeader != args.LeaderId {
-		DPrintf("FATAL: Received AppendEntries in epoch %d with leader %d, but current node leader was %d", rf.currentTerm, args.LeaderId, rf.currentLeader)
-		os.Exit(-1)
+	// No log entry at args.prevLogIndex, so return failure
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.Success = false
+		return
 	}
 
-	DPrintf("[%d] now knows that leader is %d in term %d", rf.me, args.LeaderId, rf.currentTerm)
-	rf.state = FollowerState
-	rf.currentLeader = args.LeaderId
+	// Terms don't match, hence entries don't match, so return failure
+	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+
+	logIndex := args.PrevLogIndex + 1
+	newEntriesIndex := 0
+
+	for logIndex < len(rf.log) && newEntriesIndex < len(args.Entries) {
+		if rf.log[logIndex].Term != args.Entries[newEntriesIndex].Term {
+			break
+		}
+		logIndex += 1
+		newEntriesIndex += 1
+	}
+
+	// Check for conflicts between existing and new entries
+	for i := args.PrevLogIndex + 1; i < len(rf.log); i++ {
+		entryIndex := i - (args.PrevLogIndex + 1)
+		if entryIndex < len(args.Entries) && rf.log[i].Term != args.Entries[entryIndex].Term {
+			rf.log = rf.log[:i]
+			break
+		}
+	}
+
+	// Add new entries not in log
+	numMissing := len(args.Entries) - (len(rf.log) - (args.PrevLogIndex + 1))
+	if numMissing > 0 {
+		rf.log = append(rf.log, args.Entries[(len(args.Entries)-numMissing):]...)
+	}
+
+	reply.Success = true
 }
 
 // RequestVote RPC handler
@@ -526,17 +563,112 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			continue
 		}
 
-		// prevLogIndex := index - 1
-		// prevLogTerm := -1
-		// if prevLogIndex >= 0 {
-		//     prevLogTerm := rf.log[prevLogIndex].term
-		// }
-		// entriesToSend := rf.log[rf.nextIndex[i]:]
-		// args := AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, entriesToSend, rf.commitIndex}
+		entriesToSend := rf.log[(rf.nextIndex[i]):]
+		prevLogIndex := rf.nextIndex[i] - 1
+		prevLogTerm := -1
+		if prevLogIndex >= 0 {
+			prevLogTerm = rf.log[prevLogIndex].Term
+		}
+		args := AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, entriesToSend, rf.commitIndex}
 
+		go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, args AppendEntriesArgs, responseChan chan AppendEntriesContext) {
+			var reply AppendEntriesReply
+			ok := peer.Call("Raft.AppendEntries", &args, &reply)
+			appendEntriesContext := AppendEntriesContext{ok, &args, &reply, currentTerm, peerId}
+			responseChan <- appendEntriesContext
+		}(rf.currentTerm, rf.peers[i], i, args, rf.appendEntriesResponseChan)
 	}
 
 	return index, term, isLeader
+}
+
+func (rf *Raft) AppendEntriesResponseHandler() {
+	for {
+		select {
+		case appendEntriesContext := <-rf.appendEntriesResponseChan:
+			rf.mu.Lock()
+
+			if !appendEntriesContext.ok {
+				continue
+			}
+
+			// 3 terms: (A) term request was sent (B) term in response (C) term we are in
+			// Note that B >= A based on AppendEntries handler implementation
+			//  if B > C: switch to follower; return
+			//  if B < C: return
+			//  if A < B == C: return, since response is rejected request
+			//  if A == B == C: normal handler
+
+			peer := appendEntriesContext.peerId
+			args := appendEntriesContext.args
+			response := appendEntriesContext.reply
+
+			// If response is from future epoch, move forward our epoch and transition to follower
+			if response.Term > rf.currentTerm {
+				rf.moveToNewTerm(appendEntriesContext.reply.Term, -1)
+				continue
+			}
+
+			// If response is for request from previous epoch, ignore
+			if response.Term < rf.currentTerm {
+				continue
+			}
+
+			// Response is rejection since request was stale and got rejected
+			if appendEntriesContext.term < response.Term {
+				continue
+			}
+
+			if response.Success {
+				newMatchIndex := args.PrevLogIndex + len(args.Entries)
+				if newMatchIndex > rf.matchIndex[peer] {
+					rf.matchIndex[peer] = newMatchIndex
+					rf.nextIndex[peer] = newMatchIndex + 1
+				}
+			} else {
+				// Conflict at args.PrevLogIndex (or follower didn't have anything there), so decrement nextIndex[peer] and try again
+				// Actually, always safe to send AppendEntries() that won't delete date (since AppendEntries is idempotent) WRONG but actually, not safe to decrement rf.nextIndex[peer]!
+				// If there was a conflict, we may have solved it through later RPCs
+				if args.PrevLogIndex < rf.matchIndex[peer] {
+					rf.nextIndex[peer] -= 1
+
+					// Resend request with new nextIndex
+					entriesToSend := rf.log[(rf.nextIndex[peer]):]
+					prevLogIndex := rf.nextIndex[peer] - 1
+					prevLogTerm := -1
+					if prevLogIndex >= 0 {
+						prevLogTerm = rf.log[prevLogIndex].Term
+					}
+					args := AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, prevLogTerm, entriesToSend, rf.commitIndex}
+					go func(currentTerm int, peer *labrpc.ClientEnd, peerId int, args AppendEntriesArgs, responseChan chan AppendEntriesContext) {
+						var reply AppendEntriesReply
+						ok := peer.Call("Raft.AppendEntries", &args, &reply)
+						appendEntriesContext := AppendEntriesContext{ok, &args, &reply, currentTerm, peerId}
+						responseChan <- appendEntriesContext
+					}(rf.currentTerm, rf.peers[peer], i, args, rf.appendEntriesResponseChan)
+				}
+			}
+
+			for logIndex := len(rf.log) - 1; logIndex > rf.commitIndex; logIndex-- {
+				numMatching := 0
+				for peer, _ := range rf.peers {
+					if peer == rf.me {
+						numMatching += 1
+						continue
+					}
+					if rf.matchIndex[peer] >= logIndex {
+						numMatching += 1
+					}
+				}
+				if numMatching >= ((len(rf.peers) / 2) + 1) {
+					rf.commitIndex = logIndex
+					break
+				}
+			}
+		}
+
+		rf.mu.Unlock()
+	}
 }
 
 //
@@ -584,9 +716,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rand.Seed(time.Now().UnixNano())
 	rf.electionTimeoutMs = rand.Intn(ElectionTimeoutMaxMs-ElectionTimeoutMinMs) + ElectionTimeoutMinMs
 	DPrintf("[%d] has election timeout %d", rf.me, rf.electionTimeoutMs)
-	rf.heartbeatReplyChan = make(chan HeartbeatInfo)
+	rf.heartbeatReplyChan = make(chan AppendEntriesContext)
 	go rf.ElectionTimeout(rf.electionTimeoutMs)
 	go rf.RunHeartbeat()
+	go rf.AppendEntriesResponseHandler()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

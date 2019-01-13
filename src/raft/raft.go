@@ -39,6 +39,8 @@ package raft
 // In future version: use channel as semaphore to limit number of outgoing RPC requests to prevent network  congestion/overload (needs to be priority-based though?)
 
 import (
+	"bytes"
+	"labgob"
 	"labrpc"
 	"math/rand"
 	"os"
@@ -143,14 +145,13 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 func Min(a int, b int) int {
@@ -165,19 +166,18 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		return
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // RPC field names must start with capital letters!
@@ -481,6 +481,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	// DPrintf("[%d] AppendEntries() post-lock", rf.me)
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	// Some other node has conflicting leader for the same epoch; for now, consider this a fatal error,but could have better recovery strategy
 	if args.Term == rf.currentTerm && rf.currentLeader != -1 && rf.currentLeader != args.LeaderId {
@@ -581,6 +582,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	// DPrintf("[%d] just got RequestVote lock to respond to %d", rf.me, args.CandidateId)
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	// DPrintf("[%d] received RequestVote from %d", rf.me, args.CandidateId)
 

@@ -186,6 +186,7 @@ func (rf *Raft) becomeLeader() {
 	go rf.RunHeartbeat(rf.currentTerm)
 }
 
+// Precondition: rf.mu is locked
 func (rf *Raft) becomeFollower(newTerm int) {
 	rf.state = FollowerState
 	rf.currentTerm = newTerm
@@ -223,16 +224,6 @@ func (rf *Raft) sendAllVotes(votesInfoChan chan RequestVoteContext) {
 	}
 }
 
-// Precondition: rf.mu is locked
-// Usually called when we get a RPC reply with a higher term, which means we should immediately move to follower state
-// Also provide new leader, or -1 if not known (which happens if we got heartbeat back with higher term without new leader info)
-func (rf *Raft) moveToNewTerm(newTerm int, newLeader int) {
-	rf.currentTerm = newTerm
-	rf.currentLeader = newLeader
-	rf.votedFor = -1         // since we're moving to this term, we by definition haven't voted for anyone yet
-	rf.state = FollowerState // anytime we move to new term we move to follower state, except when we increment term after detecting leader failure and becoming candidate
-}
-
 // Blocks, so should be run as goroutine
 func (rf *Raft) RunHeartbeat(currentTerm int) {
 	for {
@@ -253,7 +244,8 @@ func (rf *Raft) RunHeartbeat(currentTerm int) {
 	}
 }
 
-func (rf *Raft) CommitRemaining() {
+// Precondition: rf.mu is locked
+func (rf *Raft) commitRemaining() {
 	for rf.commitIndex > rf.lastApplied {
 		rf.lastApplied += 1
 		// DPrintf("[%d] committing entry %d", rf.me, rf.lastApplied)
@@ -455,8 +447,7 @@ func (rf *Raft) SendAppendEntriesToPeer(peer int, currentTerm int) {
 		if numMatching >= ((len(rf.peers)/2)+1) && rf.log[logIndex].Term == rf.currentTerm {
 			IPrintf("[%d] commiting entries through %d", rf.me, logIndex)
 			rf.commitIndex = logIndex
-			// DPrintf("CommitRemaining C")
-			rf.CommitRemaining()
+			rf.commitRemaining()
 			break
 		}
 	}
@@ -514,7 +505,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(args.Entries) == 0 {
 		if args.LeaderCommitIndex > rf.commitIndex {
 			rf.commitIndex = Min(len(rf.log)-1, args.LeaderCommitIndex)
-			rf.CommitRemaining()
+			rf.commitRemaining()
 		}
 
 		reply.Success = true
@@ -549,7 +540,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.LeaderCommitIndex > rf.commitIndex {
 		rf.commitIndex = Min(len(rf.log)-1, args.LeaderCommitIndex)
-		rf.CommitRemaining()
+		rf.commitRemaining()
 	}
 
 	if numMissing > 0 {

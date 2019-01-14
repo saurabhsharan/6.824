@@ -165,8 +165,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int  // later term for leader to update itself
-	Success bool // true if follower had matching previous log entry
+	Term               int  // later term for leader to update itself
+	Success            bool // true if follower had matching previous log entry
+	SuggestedPrevIndex int
 }
 
 // Precondition: rf.mu is locked
@@ -440,7 +441,11 @@ func (rf *Raft) SendAppendEntriesToPeer(peer int, currentTerm int) {
 		}
 	} else {
 		// if args.PrevLogIndex < rf.matchIndex[peer] {
-		rf.nextIndex[peer] -= 1
+		if reply.SuggestedPrevIndex != -1 && reply.SuggestedPrevIndex < rf.nextIndex[peer]-1 {
+			rf.nextIndex[peer] = reply.SuggestedPrevIndex + 1
+		} else {
+			rf.nextIndex[peer] -= 1
+		}
 		go rf.SendAppendEntriesToPeer(peer, currentTerm)
 		// }
 	}
@@ -504,12 +509,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex >= len(rf.log) {
 		DPrintf("[%d t %d] [AppendEntries from leader %d] doesn't have entry at %d, log = %s", rf.me, rf.currentTerm, args.LeaderId, args.PrevLogIndex, rf.logDebugString())
 		reply.Success = false
+		reply.SuggestedPrevIndex = len(rf.log) - 1
 		return
 	}
 
 	// Terms don't match, hence entries don't match, so return failure
 	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		DPrintf("[%d t %d] [AppendEntries from leader %d] terms don't match at position %d, log = %s", rf.me, rf.currentTerm, args.LeaderId, args.PrevLogIndex, rf.logDebugString())
+		reply.SuggestedPrevIndex = -1
+		conflictingTerm := rf.log[args.PrevLogIndex].Term
+		for i := 0; i < len(rf.log); i++ {
+			if rf.log[i].Term == conflictingTerm {
+				reply.SuggestedPrevIndex = i
+				break
+			}
+		}
 		reply.Success = false
 		return
 	}

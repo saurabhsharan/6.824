@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"fmt"
 	"labgob"
 	"labrpc"
 	"math/rand"
@@ -38,8 +39,8 @@ const HeartbeatIntervalMs = 100
 const ElectionWinTimeoutMs = 200
 
 // Minimum and maximum range to randomly choose election timeouts from
-const ElectionTimeoutMinMs = 800
-const ElectionTimeoutMaxMs = 1500
+const ElectionTimeoutMinMs = 500
+const ElectionTimeoutMaxMs = 1200
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -52,12 +53,11 @@ type Raft struct {
 	state int // Current state, one of {FollowerState, CandidateState, LeaderState}
 
 	// Election-related state
-	currentTerm               int                       // Latest term seen
-	currentLeader             int                       // Index of leader for current term, or -1 if none elected yet
-	votedFor                  int                       // CandidateId that received vote in current term, or -1 if none voted for yet
-	electionTimeoutMs         int                       // Election timeout, in ms
-	lastHeartbeatNano         int64                     // Timestamp of last heartbeat received from a valid leader, in unix time nanoseconds
-	appendEntriesResponseChan chan AppendEntriesContext // Single goroutine that handles all responses
+	currentTerm       int   // Latest term seen
+	currentLeader     int   // Index of leader for current term, or -1 if none elected yet
+	votedFor          int   // CandidateId that received vote in current term, or -1 if none voted for yet
+	electionTimeoutMs int   // Election timeout, in ms
+	lastHeartbeatNano int64 // Timestamp of last heartbeat received from a valid leader, in unix time nanoseconds
 
 	// Log state
 	log         []LogEntry // Log
@@ -135,6 +135,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
 		return
 	} else {
+		// IPrintf("[%d] being restarted to term %d", rf.me, currentTerm)
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
@@ -188,11 +189,14 @@ func (rf *Raft) becomeLeader() {
 
 // Precondition: rf.mu is locked
 func (rf *Raft) becomeFollower(newTerm int) {
+	if rf.state == LeaderState {
+		IPrintf("[%d] moving from leader to follower in term %d", rf.me, newTerm)
+	}
 	rf.state = FollowerState
 	rf.currentTerm = newTerm
 	rf.votedFor = -1
 	rf.currentLeader = -1
-	go rf.ElectionTimeout(rf.electionTimeoutMs)
+	// go rf.ElectionTimeout(rf.electionTimeoutMs)
 }
 
 // Precondition: rf.mu is locked
@@ -245,6 +249,16 @@ func (rf *Raft) RunHeartbeat(currentTerm int) {
 }
 
 // Precondition: rf.mu is locked
+func (rf *Raft) logDebugString() string {
+	if len(rf.log) < 2 {
+		return fmt.Sprintf("%v", rf.log)
+	}
+	entry1 := rf.log[0]
+	entry2 := rf.log[len(rf.log)-1]
+	return fmt.Sprintf("%v..%v", entry1, entry2)
+}
+
+// Precondition: rf.mu is locked
 func (rf *Raft) commitRemaining() {
 	for rf.commitIndex > rf.lastApplied {
 		rf.lastApplied += 1
@@ -262,7 +276,7 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 
 		if rf.state == LeaderState {
 			rf.mu.Unlock()
-			return
+			continue
 		}
 
 		if !rf.shouldStartElection(electionTimeoutMs) {
@@ -273,7 +287,7 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 		rf.currentTerm = rf.currentTerm + 1
 		electionStartTerm := rf.currentTerm
 
-		DPrintf("[%d] hit election timeout, starting election, new term is %d", rf.me, rf.currentTerm)
+		IPrintf("[%d] hit election timeout, starting election, new term is %d", rf.me, rf.currentTerm)
 
 		rf.state = CandidateState
 		rf.votedFor = rf.me
@@ -352,20 +366,19 @@ func (rf *Raft) ElectionTimeout(electionTimeoutMs int) {
 		}
 
 		if wonElection && lostElection {
-			DPrintf("INTERNAL ERROR: both wonElection and lostElection are true")
+			EPrintf("FATAL ERROR: both wonElection and lostElection are true")
+			os.Exit(-1)
 		}
 
 		if wonElection {
-			IPrintf("[%d] received %d votes, becoming the leader, log = %v", rf.me, votesReceived, rf.log)
+			IPrintf("[%d, t %d] received %d votes, becoming the leader, log = %s", rf.me, rf.currentTerm, votesReceived, rf.logDebugString())
 			rf.becomeLeader()
-			rf.mu.Unlock()
-			return
 		}
 
 		if lostElection {
 			rf.state = FollowerState
 			rf.lastHeartbeatNano = time.Now().UnixNano()
-			DPrintf("[%d] didn't get enough votes, going back to follower", rf.me)
+			DPrintf("[%d, t %d] didn't get enough votes, going back to follower", rf.me, rf.currentTerm)
 		}
 
 		rf.mu.Unlock()
@@ -445,7 +458,7 @@ func (rf *Raft) SendAppendEntriesToPeer(peer int, currentTerm int) {
 			}
 		}
 		if numMatching >= ((len(rf.peers)/2)+1) && rf.log[logIndex].Term == rf.currentTerm {
-			IPrintf("[%d] commiting entries through %d", rf.me, logIndex)
+			IPrintf("[%d t %d] commiting entries through %d", rf.me, rf.currentTerm, logIndex)
 			rf.commitIndex = logIndex
 			rf.commitRemaining()
 			break
@@ -471,7 +484,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		if rf.currentLeader != -1 && rf.currentLeader != args.LeaderId {
 			// Some other node has conflicting leader for the same epoch; for now, consider this a fatal error,but could have better recovery strategy
-			EPrintf("[%d] FATAL: Received AppendEntries in epoch %d with leader %d, but current node leader was %d", rf.me, rf.currentTerm, args.LeaderId, rf.currentLeader)
+			EPrintf("[%d t %d] FATAL: Received AppendEntries with leader %d, but current node leader was %d", rf.me, rf.currentTerm, args.LeaderId, rf.currentLeader)
 			os.Exit(-1)
 		}
 
@@ -489,14 +502,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// No log entry at args.prevLogIndex, so return failure
 	if args.PrevLogIndex >= len(rf.log) {
-		DPrintf("[%d] [AppendEntries] doesn't have entry at %d, log = %v", rf.me, args.PrevLogIndex, rf.log)
+		DPrintf("[%d t %d] [AppendEntries from leader %d] doesn't have entry at %d, log = %s", rf.me, rf.currentTerm, args.LeaderId, args.PrevLogIndex, rf.logDebugString())
 		reply.Success = false
 		return
 	}
 
 	// Terms don't match, hence entries don't match, so return failure
 	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		DPrintf("[%d] [AppendEntries] terms don't match at position %d, log = %v", rf.me, args.PrevLogIndex, rf.log)
+		DPrintf("[%d t %d] [AppendEntries from leader %d] terms don't match at position %d, log = %s", rf.me, rf.currentTerm, args.LeaderId, args.PrevLogIndex, rf.logDebugString())
 		reply.Success = false
 		return
 	}
@@ -544,7 +557,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if numMissing > 0 {
-		IPrintf("[%d] [AppendEntries] stored %d entries starting at %d, term %d, log = %v", rf.me, numMissing, args.PrevLogIndex+1, rf.currentTerm, rf.log)
+		DPrintf("[%d t %d] [AppendEntries] stored %d entries starting at %d, log = %s", rf.me, rf.currentTerm, numMissing, args.PrevLogIndex+1, rf.logDebugString())
 	}
 
 	reply.Success = true
@@ -577,7 +590,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	grantVote := noCurrentLeader && canVoteForCandidate && validLogVersion
 
 	if grantVote {
-		DPrintf("[%d] voted for %d in term %d (args.LastLogTerm = %d, ourLastLogTerm = %d, log = %v)", rf.me, args.CandidateId, rf.currentTerm, args.LastLogTerm, lastLogTerm, rf.log)
+		DPrintf("[%d] voted for %d in term %d (args.LastLogTerm = %d, ourLastLogTerm = %d, log = %s)", rf.me, args.CandidateId, rf.currentTerm, args.LastLogTerm, lastLogTerm, rf.logDebugString())
 		rf.votedFor = args.CandidateId
 		rf.lastHeartbeatNano = time.Now().UnixNano()
 	}
@@ -605,6 +618,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := rf.state == LeaderState
 
 	if !isLeader {
+		// IPrintf("[%d t %d] rejecting %v since not leader", rf.me, rf.currentTerm, command)
 		return -1, -1, isLeader
 	}
 
@@ -668,14 +682,13 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// can disable rand.seed() for more determinism
 	rand.Seed(time.Now().UnixNano())
 	rf.electionTimeoutMs = rand.Intn(ElectionTimeoutMaxMs-ElectionTimeoutMinMs) + ElectionTimeoutMinMs
-	rf.appendEntriesResponseChan = make(chan AppendEntriesContext, 100)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	go rf.ElectionTimeout(rf.electionTimeoutMs)
 
-	DPrintf("[%d] CREATED with election timeout %d, log = %v", rf.me, rf.electionTimeoutMs, rf.log)
+	DPrintf("[%d] CREATED with election timeout %d, log = %s", rf.me, rf.electionTimeoutMs, rf.logDebugString())
 
 	return rf
 }

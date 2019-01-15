@@ -242,6 +242,9 @@ func (rf *Raft) RunHeartbeat(currentTerm int) {
 		}
 
 		for i, _ := range rf.peers {
+			if i == rf.me {
+				continue
+			}
 			go rf.SendAppendEntriesToPeer(i, rf.currentTerm)
 		}
 
@@ -395,6 +398,10 @@ func (rf *Raft) SendAppendEntriesToPeer(peer int, currentTerm int) {
 		return
 	}
 
+	if rf.nextIndex[peer] >= (len(rf.log)+1) || rf.nextIndex[peer] < 0 {
+		IPrintf("[%d t %d] LOOK HERE have out-of-bounds nextIndex = %d for peer %d, our log size = %d", rf.me, rf.currentTerm, rf.nextIndex[peer], peer, len(rf.log))
+		IPrintf("[%d t %d] rf.nextIndex = %v", rf.me, rf.currentTerm, rf.nextIndex)
+	}
 	entriesToSend := rf.log[(rf.nextIndex[peer]):]
 	prevLogIndex := rf.nextIndex[peer] - 1
 	prevLogTerm := -1
@@ -438,13 +445,16 @@ func (rf *Raft) SendAppendEntriesToPeer(peer int, currentTerm int) {
 		if newMatchIndex > rf.matchIndex[peer] {
 			rf.matchIndex[peer] = newMatchIndex
 			rf.nextIndex[peer] = newMatchIndex + 1
+			DPrintf("[%d t %d] A rf.nextIndex[%d] is now %d", rf.me, rf.currentTerm, peer, rf.nextIndex[peer])
 		}
 	} else {
 		// if args.PrevLogIndex < rf.matchIndex[peer] {
 		if reply.SuggestedPrevIndex != -1 && reply.SuggestedPrevIndex < rf.nextIndex[peer]-1 {
 			rf.nextIndex[peer] = reply.SuggestedPrevIndex + 1
-		} else {
+			DPrintf("[%d t %d] B rf.nextIndex[%d] is now %d", rf.me, rf.currentTerm, peer, rf.nextIndex[peer])
+		} else if rf.nextIndex[peer] > 0 {
 			rf.nextIndex[peer] -= 1
+			DPrintf("[%d t %d] C rf.nextIndex[%d] is now %d", rf.me, rf.currentTerm, peer, rf.nextIndex[peer])
 		}
 		go rf.SendAppendEntriesToPeer(peer, currentTerm)
 		// }
@@ -643,7 +653,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.log = append(rf.log, LogEntry{term, command})
 
-	IPrintf("[%d leader] adding new log entry at index %d, term %d, value %v", rf.me, index, term, command)
+	IPrintf("[%d leader %d] adding new log entry at index %d, value %v", rf.me, rf.currentTerm, index, command)
 
 	for i, _ := range rf.peers {
 		if i == rf.me {

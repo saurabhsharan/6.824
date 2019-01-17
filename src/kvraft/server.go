@@ -62,9 +62,8 @@ func makePendingOp(op Op, term int, index int) PendingOp {
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	kv.mu.Lock()
-
 	// Check for duplicate client request
+	kv.mu.Lock()
 	clientResult, ok := kv.lastClientResult[args.ClientId]
 	if ok && clientResult.requestId == args.RequestId {
 		reply.WrongLeader = false
@@ -75,7 +74,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	op := Op{"Get", args.ClientId, args.RequestId, args.Key, ""}
+	kv.mu.Unlock()
 	index, term, isLeader := kv.rf.Start(op)
+	kv.mu.Lock()
 
 	if !isLeader {
 		reply.WrongLeader = true
@@ -89,7 +90,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	oldPendingOp, ok := kv.pendingOps[index]
 	if ok {
 		// Allow existing RPC call to complete
+		DPrintf("[kvserver %d] ABOUT TO clear existing pending op Get() at index %d", kv.me, index)
 		oldPendingOp.failChan <- true
+		DPrintf("[kvserver %d] DONE clearing existing pending op Get() at index %d", kv.me, index)
 	}
 	kv.pendingOps[index] = pendingOp
 	kv.mu.Unlock()
@@ -106,21 +109,35 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	// Check for duplicate client request
+	kv.mu.Lock()
+	clientResult, ok := kv.lastClientResult[args.ClientId]
+	if ok && clientResult.requestId == args.RequestId {
+		reply.WrongLeader = false
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+
 	op := Op{args.Op, args.ClientId, args.RequestId, args.Key, args.Value}
+	kv.mu.Unlock()
 	index, term, isLeader := kv.rf.Start(op)
+	kv.mu.Lock()
 
 	if !isLeader {
 		reply.WrongLeader = true
+		kv.mu.Unlock()
 		return
 	}
 
 	pendingOp := makePendingOp(op, term, index)
 
-	kv.mu.Lock()
 	oldPendingOp, ok := kv.pendingOps[index]
 	if ok {
 		// Allow existing RPC call to complete
+		DPrintf("[kvserver %d] ABOUT TO clear existing pending op PutAppend() at index %d", kv.me, index)
 		oldPendingOp.failChan <- true
+		DPrintf("[kvserver %d] DONE clearing existing pending op PutAppend() at index %d", kv.me, index)
 	}
 	kv.pendingOps[index] = pendingOp
 	kv.mu.Unlock()
@@ -146,7 +163,7 @@ func (kv *KVServer) Kill() {
 }
 
 // Blocks on applyCh. Should always be run in new goroutine.
-func (kv *KVServer) ReadApplied() {
+func (kv *KVServer) ApplyCommands() {
 	for {
 		applyNext := <-kv.applyCh
 
@@ -157,7 +174,7 @@ func (kv *KVServer) ReadApplied() {
 			continue
 		}
 
-		DPrintf("[%d] got apply %v", kv.me, applyNext)
+		// DPrintf("[%d] got apply %v", kv.me, applyNext)
 
 		op := applyNext.Command.(Op)
 		// Extract fields from command
@@ -186,12 +203,14 @@ func (kv *KVServer) ReadApplied() {
 		pendingOp, havePendingOp := kv.pendingOps[applyNext.CommandIndex]
 
 		if havePendingOp {
-			DPrintf("[kvserver %d] has pending op at index %d", kv.me, applyNext.CommandIndex)
+			DPrintf("[kvserver %d] has pending op %s at index %d", kv.me, op.Name, applyNext.CommandIndex)
 		}
 
 		// Check for term inconsistency
 		if havePendingOp && pendingOp.term != applyNext.CommandTerm {
+			DPrintf("[kvserver %d] ABOUT TO clear term conflicting pending op at index %d", kv.me, applyNext.CommandIndex)
 			pendingOp.failChan <- true
+			DPrintf("[kvserver %d] DONE clear term conflicting pending op at index %d", kv.me, applyNext.CommandIndex)
 			delete(kv.pendingOps, applyNext.CommandIndex)
 			kv.mu.Unlock()
 			continue
@@ -213,6 +232,7 @@ func (kv *KVServer) ReadApplied() {
 			if havePendingOp {
 				pendingOp.doneChan <- op.Value
 			}
+			kv.lastClientResult[op.ClientId] = ClientResult{op.RequestId, ""}
 		} else if op.Name == "Append" {
 			newValue := op.Value
 			if ok {
@@ -222,6 +242,7 @@ func (kv *KVServer) ReadApplied() {
 			if havePendingOp {
 				pendingOp.doneChan <- newValue
 			}
+			kv.lastClientResult[op.ClientId] = ClientResult{op.RequestId, ""}
 		}
 
 		kv.mu.Unlock()
@@ -255,10 +276,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.lastClientResult = make(map[int64]ClientResult)
 	kv.pendingOps = make(map[int]PendingOp)
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 10)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	go kv.ReadApplied()
+	go kv.ApplyCommands()
 
 	return kv
 }

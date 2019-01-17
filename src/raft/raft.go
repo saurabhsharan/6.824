@@ -24,6 +24,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 }
 
 const (
@@ -267,7 +268,7 @@ func (rf *Raft) commitRemaining() {
 	for rf.commitIndex > rf.lastApplied {
 		rf.lastApplied += 1
 		// DPrintf("[%d] committing entry %d", rf.me, rf.lastApplied)
-		msg := ApplyMsg{true, rf.log[rf.lastApplied].Command, rf.lastApplied + 1}
+		msg := ApplyMsg{true, rf.log[rf.lastApplied].Command, rf.lastApplied + 1, rf.log[rf.lastApplied].Term}
 		rf.applyChan <- msg
 	}
 }

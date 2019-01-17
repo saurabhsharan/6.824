@@ -3,11 +3,13 @@ package raftkv
 import "labrpc"
 import "crypto/rand"
 import "math/big"
-
+import "sync"
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	mu            sync.Mutex
+	servers       []*labrpc.ClientEnd
+	clientId      int64
+	nextRequestId int64
 }
 
 func nrand() int64 {
@@ -20,11 +22,11 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+	ck.clientId = nrand()
+	ck.nextRequestId = 1
 	return ck
 }
 
-//
 // fetch the current value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
@@ -35,14 +37,25 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) Get(key string) string {
+	ck.mu.Lock()
+	requestId := ck.nextRequestId
+	ck.nextRequestId += 1
+	ck.mu.Unlock()
 
-	// You will have to modify this function.
-	return ""
+	for {
+		for i, _ := range ck.servers {
+			// DPrintf("sending request %d to server %d", requestId, i)
+			args := GetArgs{key, ck.clientId, requestId}
+			var reply GetReply
+			ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
+			if ok && reply.Err == OK && !reply.WrongLeader {
+				return reply.Value
+			}
+		}
+	}
 }
 
-//
 // shared by Put and Append.
 //
 // you can send an RPC with code like this:
@@ -51,9 +64,23 @@ func (ck *Clerk) Get(key string) string {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	ck.mu.Lock()
+	requestId := ck.nextRequestId
+	ck.nextRequestId += 1
+	ck.mu.Unlock()
+
+	for {
+		for i, _ := range ck.servers {
+			// DPrintf("sending request %d to server %d", requestId, i)
+			args := PutAppendArgs{key, value, op, ck.clientId, requestId}
+			var reply GetReply
+			ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+			if ok && reply.Err == OK && !reply.WrongLeader {
+				return
+			}
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
